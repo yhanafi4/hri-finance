@@ -14,13 +14,15 @@
     <!-- Memuat React & ReactDOM dari CDNJS (Lebih Stabil & Cepat) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
-    
+
     <!-- Memuat Babel dari CDNJS -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.1/babel.min.js"></script>
 
     <!-- Memuat SheetJS untuk Export/Import Excel (XLSX) -->
     <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
 
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    
     <style>
         @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
         .animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
@@ -91,7 +93,7 @@
         // ============================================================================
         // PENTING: Biarkan kosong "" jika dijalankan dari web preview sini.
         // Jika Anda simpan ke laptop (dijalankan tanpa internet / local server pribadi), isi dengan API Key Anda sendiri!
-        const apiKey = ""; 
+        const apiKey = "AIzaSyAblwh94FAncISwsjqgL7F0Ej4Vg6S-8DY"; 
 
         const callGemini = async (prompt) => {
             // PERBAIKAN: Menggunakan endpoint gemini-2.5-flash-preview agar tidak error 404
@@ -119,99 +121,84 @@
             }
         };
 
-        // ============================================================================
-        // 2. SISTEM DATABASE BROWSER OFFLINE DINAMIS (INDEXED DB)
-        // ============================================================================
-        let currentDbPromise = null;
-        let dbListeners = { customers: [], jobcodes: [], progresses: [], invoices: [], bank_accounts: [] };
+// ============================================================================
+// 2. SISTEM DATABASE CLOUD (SUPABASE REALTIME)
+// ============================================================================
 
-        const initDB = (dbName) => {
-            dbListeners = { customers: [], jobcodes: [], progresses: [], invoices: [], bank_accounts: [] };
-            currentDbPromise = new Promise((resolve) => {
-                const req = indexedDB.open(`HRI_DB_${dbName}`, 3); 
-                req.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    ['customers', 'jobcodes', 'progresses', 'invoices', 'bank_accounts'].forEach(store => {
-                        if (!db.objectStoreNames.contains(store)) db.createObjectStore(store, { keyPath: 'id' });
-                    });
-                };
-                req.onsuccess = () => resolve(req.result);
-            });
-            return currentDbPromise;
-        };
+// Pastikan Anda sudah memasukkan URL dan KEY dari Dashboard Supabase Anda
+const SUPABASE_URL = 'https://xyzabc.supabase.co'; // Ganti dengan URL Anda
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1...';        // Ganti dengan API Key Anon Anda
+const _supabase = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-        const notifyDb = async (storeName) => {
-            if (!currentDbPromise) return;
-            const db = await currentDbPromise;
-            const tx = db.transaction(storeName, 'readonly');
-            const req = tx.objectStore(storeName).getAll();
-            req.onsuccess = () => {
-                let data = req.result;
-                if (storeName === 'progresses') {
-                    data.sort((a, b) => {
-                        const idxA = a.sortIndex !== undefined ? a.sortIndex : new Date(a.createdAt||0).getTime() / 1000000;
-                        const idxB = b.sortIndex !== undefined ? b.sortIndex : new Date(b.createdAt||0).getTime() / 1000000;
-                        return idxA - idxB;
-                    });
-                } else {
-                    data.sort((a,b) => new Date(b.createdAt||0) - new Date(a.createdAt||0)); 
-                }
-                if (dbListeners[storeName]) {
-                    dbListeners[storeName].forEach(cb => cb(data));
-                }
-            };
-        };
+// Fungsi Listener untuk Update Data Otomatis di Layar (Realtime)
+const onSnapshotData = (storeName, callback) => {
+    // 1. Ambil data awal saat aplikasi dibuka
+    const fetchData = async () => {
+        const { data, error } = await _supabase
+            .from(storeName)
+            .select('*')
+            .order('created_at', { ascending: false });
+        
+        if (!error) callback(data);
+    };
+    fetchData();
 
-        const onSnapshotData = (storeName, callback) => {
-            if (!dbListeners[storeName]) dbListeners[storeName] = [];
-            dbListeners[storeName].push(callback);
-            notifyDb(storeName);
-            return () => { if(dbListeners[storeName]) dbListeners[storeName] = dbListeners[storeName].filter(cb => cb !== callback); };
-        };
+    // 2. Pasang 'Listener' agar jika ada perubahan di cloud, layar otomatis update
+    const channel = _supabase
+        .channel(`public:${storeName}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: storeName }, (payload) => {
+            fetchData(); // Ambil ulang data jika ada perubahan
+        })
+        .subscribe();
 
-        const addData = async (storeName, data) => {
-            const db = await currentDbPromise;
-            const generatedId = Date.now().toString() + Math.floor(Math.random()*1000);
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction(storeName, 'readwrite');
-                tx.objectStore(storeName).add({ ...data, id: generatedId });
-                tx.oncomplete = () => { notifyDb(storeName); resolve(generatedId); };
-                tx.onerror = (e) => reject(e);
-            });
-        };
+    return () => { _supabase.removeChannel(channel); };
+};
 
-        const updateData = async (storeName, id, data) => {
-            const db = await currentDbPromise;
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction(storeName, 'readwrite');
-                const store = tx.objectStore(storeName);
-                const req = store.get(id);
-                req.onsuccess = () => { store.put({ ...req.result, ...data, id: id }); };
-                tx.oncomplete = () => { notifyDb(storeName); resolve(); };
-                tx.onerror = (e) => reject(e);
-            });
-        };
+// Fungsi Tambah Data ke Cloud
+const addData = async (storeName, data) => {
+    const { data: result, error } = await _supabase
+        .from(storeName)
+        .insert([{ ...data, created_at: new Date() }]);
+    
+    if (error) throw error;
+    return result;
+};
 
-        const deleteData = async (storeName, id) => {
-            const db = await currentDbPromise;
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction(storeName, 'readwrite');
-                tx.objectStore(storeName).delete(id);
-                tx.oncomplete = () => { notifyDb(storeName); resolve(); };
-                tx.onerror = (e) => reject(e);
-            });
-        };
+// Fungsi Update Data di Cloud
+const updateData = async (storeName, id, data) => {
+    const { error } = await _supabase
+        .from(storeName)
+        .update(data)
+        .eq('id', id);
+    
+    if (error) throw error;
+};
 
-        const deleteMultipleData = async (storeName, ids) => {
-            const db = await currentDbPromise;
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction(storeName, 'readwrite');
-                const store = tx.objectStore(storeName);
-                ids.forEach(id => store.delete(id));
-                tx.oncomplete = () => { notifyDb(storeName); resolve(); };
-                tx.onerror = (e) => reject(e);
-            });
-        };
+// Fungsi Hapus Satu Data di Cloud
+const deleteData = async (storeName, id) => {
+    const { error } = await _supabase
+        .from(storeName)
+        .delete()
+        .eq('id', id);
+    
+    if (error) throw error;
+};
+
+// Fungsi Hapus Banyak Data di Cloud
+const deleteMultipleData = async (storeName, ids) => {
+    const { error } = await _supabase
+        .from(storeName)
+        .delete()
+        .in('id', ids);
+    
+    if (error) throw error;
+};
+
+// Fungsi InitDB (Sekarang hanya formalitas agar kodingan React tidak error)
+const initDB = async (dbName) => {
+    console.log("Connected to Cloud Database: " + dbName);
+    return true; 
+};
 
         // ============================================================================
         // 3. KOMPONEN ICON & UTILS
